@@ -1,3 +1,4 @@
+-- Active: 1765425890106@@mysql-1a4c6be6-sulemanabdulmanan-5813.j.aivencloud.com@22696@defaultdb
 -- Products Table --
 CREATE TABLE products (
     product_id INT AUTO_INCREMENT PRIMARY KEY,
@@ -53,10 +54,54 @@ VALUES (
         'johnman@example.com',
         '1234567890'
     );
+
+INSERT INTO
+    products (
+        product_name,
+        category,
+        price,
+        stock_quantity,
+        reorder_level
+    )
+VALUES (
+        'Laptop Pro 15',
+        'Electronics',
+        1500.00,
+        25,
+        5
+    ),
+    (
+        'Wireless Mouse',
+        'Accessories',
+        25.50,
+        150,
+        20
+    ),
+    (
+        'Mechanical Keyboard',
+        'Accessories',
+        89.99,
+        80,
+        15
+    ),
+    (
+        'Smartphone X',
+        'Electronics',
+        999.00,
+        40,
+        10
+    ),
+    (
+        'Office Chair Deluxe',
+        'Furniture',
+        199.99,
+        30,
+        5
+    );
 -- Order Placement and Inventory Management --
 BEGIN;
 -- Create an order
-INSERT INTO orders (customer_id, order_date) VALUES (7, NOW());
+INSERT INTO orders (customer_id, order_date) VALUES (1, NOW());
 
 SET @last_order_id = LAST_INSERT_ID();
 
@@ -127,3 +172,231 @@ GROUP BY
     o.order_date,
     o.total_amount
 ORDER BY o.order_date DESC;
+
+-- Low stock flagging--
+SELECT
+    product_id,
+    product_name,
+    category,
+    stock_quantity,
+    reorder_level,
+    CASE
+        WHEN stock_quantity < reorder_level THEN '⚠️ LOW – Reorder Needed'
+        ELSE 'OK'
+    END AS status
+FROM products
+WHERE
+    stock_quantity < reorder_level
+ORDER BY stock_quantity ASC;
+
+SELECT
+    c.customer_id,
+    c.customer_name,
+    c.email,
+    ROUND(SUM(o.total_amount), 2) AS total_spent,
+    CASE
+        WHEN SUM(o.total_amount) >= 5000 THEN 'Gold'
+        WHEN SUM(o.total_amount) >= 1000 THEN 'Silver'
+        ELSE 'Bronze'
+    END AS customer_tier
+FROM customers c
+    LEFT JOIN orders o ON o.customer_id = c.customer_id
+GROUP BY
+    c.customer_id,
+    c.customer_name,
+    c.email
+ORDER BY total_spent DESC;
+-- Or last inserted order
+SET @product_id = 2;
+-- The product customer ordered
+-- The quantity ordered
+
+-- CUSTOMER INSIGHTS--
+START TRANSACTION;
+
+-- Update existing order_details with bulk discount
+UPDATE order_details od
+JOIN products p ON p.product_id = od.product_id
+SET
+    od.price = p.price * CASE
+        WHEN od.quantity >= 50 THEN 0.85
+        WHEN od.quantity >= 20 THEN 0.90
+        WHEN od.quantity >= 10 THEN 0.95
+        ELSE 1
+    END
+WHERE
+    od.order_id = @last_order_id;
+
+-- Recalculate order total after discount
+UPDATE orders
+SET
+    total_amount = (
+        SELECT SUM(quantity * price)
+        FROM order_details
+        WHERE
+            order_id = @last_order_id
+    )
+WHERE
+    order_id = @last_order_id;
+
+COMMIT;
+
+--STOCK REPLENISHMENT--
+
+SET @restock_extra = 50;
+
+START TRANSACTION;
+
+UPDATE products
+SET
+    stock_quantity = reorder_level + @restock_extra
+WHERE
+    stock_quantity < reorder_level;
+
+INSERT INTO
+    inventory_logs (
+        product_id,
+        change_type,
+        quantity_change
+    )
+SELECT product_id, 'Replenishment', (
+        reorder_level + @restock_extra - stock_quantity
+    )
+FROM products
+WHERE
+    stock_quantity = reorder_level + @restock_extra;
+
+COMMIT;
+--AUTOMATION PROCESS--
+DELIMITER $$
+
+CREATE TRIGGER trg_order_details_after_insert
+AFTER INSERT ON order_details
+FOR EACH ROW
+BEGIN
+    DECLARE discount_price DECIMAL(10,2);
+
+    -- 1. Apply bulk discount based on quantity
+    SET discount_price = NEW.quantity *
+        CASE
+            WHEN NEW.quantity >= 50 THEN NEW.price * 0.85
+            WHEN NEW.quantity >= 20 THEN NEW.price * 0.90
+            WHEN NEW.quantity >= 10 THEN NEW.price * 0.95
+            ELSE NEW.price
+        END;
+
+    -- 2. Update the price in order_details
+    UPDATE order_details
+    SET price = discount_price / NEW.quantity
+    WHERE order_detail_id = NEW.order_detail_id;
+
+    -- 3. Reduce stock
+    UPDATE products
+    SET stock_quantity = stock_quantity - NEW.quantity
+    WHERE product_id = NEW.product_id;
+
+    -- 4. Insert inventory log
+    INSERT INTO inventory_logs (product_id, change_type, quantity_change)
+    VALUES (NEW.product_id, 'Order Placed', -NEW.quantity);
+
+    -- 5. Update order total
+    UPDATE orders o
+    SET total_amount = (
+        SELECT SUM(quantity * price)
+        FROM order_details
+        WHERE order_id = o.order_id
+    )
+    WHERE o.order_id = NEW.order_id;
+
+END$$
+
+DELIMITER;
+-- Enable event scheduler --
+SET GLOBAL event_scheduler = ON;
+
+DELIMITER $$
+
+CREATE EVENT replenish_stock_daily
+ON SCHEDULE EVERY 1 DAY
+DO
+BEGIN
+    DECLARE restock_qty INT DEFAULT 50;
+
+    -- 1. Update stock for low inventory
+    UPDATE products
+    SET stock_quantity = stock_quantity + restock_qty
+    WHERE stock_quantity < reorder_level;
+
+    -- 2. Insert logs for replenished stock
+    INSERT INTO inventory_logs (product_id, change_type, quantity_change)
+    SELECT product_id, 'Replenishment', restock_qty
+    FROM products
+    WHERE stock_quantity >= reorder_level
+          AND stock_quantity - restock_qty < reorder_level;
+
+END$$
+
+DELIMITER;
+
+--Update Customer Tiers Automatically--
+DELIMITER $$
+
+CREATE EVENT update_customer_tiers
+ON SCHEDULE EVERY 1 WEEK
+DO
+BEGIN
+    UPDATE customers c
+    LEFT JOIN (
+        SELECT customer_id, SUM(total_amount) AS total_spent
+        FROM orders
+        GROUP BY customer_id
+    ) o_sum ON c.customer_id = o_sum.customer_id
+    SET c.customer_tier = CASE
+        WHEN IFNULL(o_sum.total_spent,0) >= 5000 THEN 'Gold'
+        WHEN IFNULL(o_sum.total_spent,0) >= 1000 THEN 'Silver'
+        ELSE 'Bronze'
+    END;
+END$$
+
+DELIMITER;
+
+--View: Summarize Orders--
+CREATE OR REPLACE VIEW vw_order_summary AS
+SELECT
+    o.order_id,
+    c.customer_name,
+    o.order_date,
+    o.total_amount,
+    COUNT(od.order_detail_id) AS total_items,
+    SUM(od.quantity) AS total_quantity
+FROM
+    orders o
+    JOIN customers c ON o.customer_id = c.customer_id
+    JOIN order_details od ON o.order_id = od.order_id
+GROUP BY
+    o.order_id,
+    c.customer_name,
+    o.order_date,
+    o.total_amount
+ORDER BY o.order_date DESC;
+
+SELECT * FROM vw_order_summary;
+
+-- View: Low Stock Products--
+CREATE OR REPLACE VIEW vw_low_stock AS
+SELECT
+    product_id,
+    product_name,
+    category,
+    stock_quantity,
+    reorder_level,
+    CASE
+        WHEN stock_quantity < reorder_level THEN '⚠️ LOW – Reorder Needed'
+        ELSE 'OK'
+    END AS status
+FROM products
+WHERE
+    stock_quantity < reorder_level
+ORDER BY stock_quantity ASC;
+
+SELECT * FROM vw_low_stock;
