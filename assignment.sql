@@ -1,4 +1,4 @@
--- Active: 1765425890106@@mysql-1a4c6be6-sulemanabdulmanan-5813.j.aivencloud.com@22696@defaultdb
+-- Active: 1766944731416@@mysql-3099dfd3-sulemanabdulmanan-5813.i.aivencloud.com@22696
 -- Products Table --
 CREATE TABLE products (
     product_id INT AUTO_INCREMENT PRIMARY KEY,
@@ -400,3 +400,114 @@ WHERE
 ORDER BY stock_quantity ASC;
 
 SELECT * FROM vw_low_stock;
+
+-- Place Order Procedure --
+DELIMITER $$
+
+CREATE PROCEDURE sp_place_order(
+    IN p_customer_id INT,
+    IN p_product_id INT,
+    IN p_quantity INT
+)
+BEGIN
+    DECLARE v_order_id INT;
+    DECLARE v_price DECIMAL(10,2);
+
+    START TRANSACTION;
+
+    -- Create order
+    INSERT INTO orders (customer_id)
+    VALUES (p_customer_id);
+
+    SET v_order_id = LAST_INSERT_ID();
+
+    -- Get discounted price
+    SELECT fn_discounted_price(price, p_quantity)
+    INTO v_price
+    FROM products
+    WHERE product_id = p_product_id;
+
+    -- Insert order details
+    INSERT INTO order_details (order_id, product_id, quantity, price)
+    VALUES (v_order_id, p_product_id, p_quantity, v_price);
+
+    -- Reduce stock
+    UPDATE products
+    SET stock_quantity = stock_quantity - p_quantity
+    WHERE product_id = p_product_id;
+
+    -- Inventory log
+    INSERT INTO inventory_logs (product_id, change_type, quantity_change)
+    VALUES (p_product_id, 'Order Placed', -p_quantity);
+
+    -- Update order total
+    UPDATE orders
+    SET total_amount = (
+        SELECT SUM(quantity * price)
+        FROM order_details
+        WHERE order_id = v_order_id
+    )
+    WHERE order_id = v_order_id;
+
+    COMMIT;
+END$$
+
+DELIMITER;
+
+-- Customer Tier --
+CREATE FUNCTION fn_customer_tier(total_spent DECIMAL(10,2))
+RETURNS VARCHAR(10)
+DETERMINISTIC
+BEGIN
+    RETURN CASE
+        WHEN total_spent >= 5000 THEN 'Gold'
+        WHEN total_spent >= 1000 THEN 'Silver'
+        ELSE 'Bronze'
+    END;
+END$$
+
+DELIMITER $$
+
+-- Restock Inventory --
+CREATE PROCEDURE sp_restock_inventory(
+    IN p_extra_stock INT
+)
+BEGIN
+    START TRANSACTION;
+
+    UPDATE products
+    SET stock_quantity = reorder_level + p_extra_stock
+    WHERE stock_quantity < reorder_level;
+
+    INSERT INTO inventory_logs (product_id, change_type, quantity_change)
+    SELECT
+        product_id,
+        'Replenishment',
+        reorder_level + p_extra_stock - stock_quantity
+    FROM products
+    WHERE stock_quantity = reorder_level + p_extra_stock;
+
+    COMMIT;
+END$$
+
+DELIMITER;
+
+DELIMITER $$
+
+-- Discount calculation--
+CREATE FUNCTION fn_discounted_price(
+    base_price DECIMAL(10,2),
+    qty INT
+)
+RETURNS DECIMAL(10,2)
+DETERMINISTIC
+BEGIN
+    RETURN base_price * CASE
+        WHEN qty >= 50 THEN 0.85
+        WHEN qty >= 20 THEN 0.90
+        WHEN qty >= 10 THEN 0.95
+        ELSE 1
+    END;
+END$$
+
+DELIMITER;
